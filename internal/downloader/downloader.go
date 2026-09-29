@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -343,7 +344,8 @@ func mergeSegments(ctx context.Context, paths []string, dir string, outPath stri
 	return nil
 }
 
-// downloadFile 直链单流下载，支持 Range 断点续传（.part 临时文件，完工改名）。
+// downloadFile 直链下载：体积够大且服务端支持 Range 时走多线程分块（.mrp + .mrp.json 续传），
+// 否则回落单连接顺序下载（.part 断点续传，完工改名）。
 func downloadFile(ctx context.Context, opt Options, on Progress) (string, error) {
 	h := opt.headers()
 	name := opt.FileName
@@ -354,31 +356,45 @@ func downloadFile(ctx context.Context, opt Options, on Progress) (string, error)
 		}
 	}
 	out := filepath.Join(opt.OutDir, name)
-	part := out + ".part"
 	client := newClient()
 
-	// 探 total 和是否支持 Range。
-	total := -1
-	acceptRanges := false
-	if req, _ := http.NewRequestWithContext(ctx, "HEAD", opt.MediaURL, nil); req != nil {
-		h.apply(req)
-		if resp, err := client.Do(req); err == nil {
-			if resp.StatusCode < 400 {
-				total = int(resp.ContentLength)
-				acceptRanges = strings.Contains(strings.ToLower(resp.Header.Get("Accept-Ranges")), "bytes")
+	// 一次 HEAD 探清体积与 Range 支持情况，两条路径共用，避免重复握手。
+	total, acceptRanges, validator := probeRemote(ctx, client, opt.MediaURL, h)
+
+	if acceptRanges && total >= multiRangeThreshold {
+		err := downloadMultiRange(ctx, client, opt, h, total, validator, out, on)
+		switch {
+		case err == nil:
+			_ = os.Remove(multiRangeStatePath(out))
+			if rerr := os.Rename(multiRangePartPath(out), out); rerr != nil {
+				return "", rerr
 			}
-			resp.Body.Close()
+			if on != nil {
+				on(int(total), int(total))
+			}
+			return out, nil
+		case errors.Is(err, errRangeUnsupported):
+			// 服务端谎报支持 Range：清掉半成品，回退单连接重下。
+			_ = os.Remove(multiRangePartPath(out))
+			_ = os.Remove(multiRangeStatePath(out))
+			total, acceptRanges = -1, false
+		case ctx.Err() != nil:
+			return "", ctx.Err() // 中断：保留 .mrp 与凭证供续传
+		default:
+			return "", err
 		}
 	}
 
+	part := out + ".part"
+
 	var offset int64
 	if st, err := os.Stat(part); err == nil && st.Size() > 0 {
-		if acceptRanges && (total < 0 || st.Size() < int64(total)) {
+		if acceptRanges && (total < 0 || st.Size() < total) {
 			offset = st.Size() // 续传
-		} else if total >= 0 && st.Size() >= int64(total) {
+		} else if total >= 0 && st.Size() >= total {
 			_ = os.Rename(part, out) // 上次已下完只差改名
 			if on != nil {
-				on(total, total)
+				on(int(total), int(total))
 			}
 			return out, nil
 		} else {
@@ -405,7 +421,7 @@ func downloadFile(ctx context.Context, opt Options, on Progress) (string, error)
 		_ = os.Remove(part)
 	}
 	if total < 0 && resp.ContentLength > 0 {
-		total = int(resp.ContentLength) + int(offset)
+		total = resp.ContentLength + offset
 	}
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
@@ -435,7 +451,7 @@ func downloadFile(ctx context.Context, opt Options, on Progress) (string, error)
 			}
 			done += int64(n)
 			if on != nil {
-				on(int(done), total)
+				on(int(done), int(total))
 			}
 		}
 		if err != nil {

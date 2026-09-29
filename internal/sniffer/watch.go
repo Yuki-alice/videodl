@@ -83,7 +83,7 @@ func PollWatch(id string) (WatchUpdate, error) {
 		return WatchUpdate{}, fmt.Errorf("嗅探会话不存在")
 	}
 	// 用户关了窗口就结束会话。
-	if _, err := s.page.Eval(`1`); err != nil {
+	if _, err := s.page.Eval(pageAliveJS); err != nil {
 		StopWatch(id)
 		return WatchUpdate{Alive: false}, fmt.Errorf("浏览器窗口已关闭")
 	}
@@ -92,7 +92,7 @@ func PollWatch(id string) (WatchUpdate, error) {
 		curURL = info.URL
 	}
 	cookie := pageCookies(s.page, curURL)
-	title, _ := evalString(s.page, `document.title||''`)
+	title, _ := evalString(s.page, pageTitleJS)
 
 	raw, err := evalString(s.page, collectJS)
 	if err != nil {
@@ -160,21 +160,22 @@ func StopWatch(id string) {
 
 func startsWithBlob(u string) bool { return len(u) >= 5 && u[:5] == "blob:" }
 
-func evalStrList(page *rod.Page, js string) ([]string, error) {
-	res, err := page.Eval(js)
+func evalStrList(page *rod.Page, js string, args ...interface{}) ([]string, error) {
+	res, err := page.Eval(js, args...)
 	if err != nil {
 		return nil, err
 	}
+	// JS 返回的是「装着数组的 JSON 字符串」，用 Str() 取出内容后再解成切片。
 	var out []string
-	if err := json.Unmarshal([]byte(fmt.Sprintf("%s", res.Value)), &out); err != nil {
+	if err := json.Unmarshal([]byte(res.Value.Str()), &out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
 // memScanJS 扫 HTML 内联脚本 + window 上形如 *url/*video/*play 的变量，
-// 抓网都抓不到的地址经常藏在这里。
-const memScanJS = `(function(){
+// 抓网都抓不到的地址经常藏在这里。必须是函数形式（见 evalString 注释）。
+const memScanJS = `() => {
   var out = [];
   var pat = /https?:\/\/[^\s"'<>\\]+\.(m3u8|mpd|mp4|webm|flv|mov)([^\s"'<>]*)?/gi;
   function pushAll(s){
@@ -196,4 +197,10 @@ const memScanJS = `(function(){
     }
   } catch(e){}
   return JSON.stringify(out);
-})()`
+}`
+
+// pageAliveJS 存活探针，同样是函数形式；表达式 `1` 会让 rod 抛 TypeError。
+const pageAliveJS = `() => 1`
+
+// pageTitleJS 取当前页面标题。
+const pageTitleJS = `() => document.title || ''`

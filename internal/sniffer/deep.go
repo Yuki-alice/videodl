@@ -57,8 +57,8 @@ func DeepProbe(pageURL string, waitSec int) ([]Candidate, error) {
 	}
 	_ = page.WaitLoad()
 	time.Sleep(time.Duration(waitSec) * time.Second)
-	// 静音自动播放，逼播放器发出媒体请求。
-	_, _ = page.Eval(`[...document.querySelectorAll('video')].forEach(v=>{try{v.muted=true;v.play().catch(()=>{});}catch(e){}})`)
+	// 静音自动播放，逼播放器发出媒体请求。必须是函数形式，否则 rod 会抛错被静默吞掉。
+	_, _ = page.Eval(`() => [...document.querySelectorAll('video')].forEach(v=>{try{v.muted=true;v.play().catch(()=>{});}catch(e){}})`)
 	time.Sleep(3 * time.Second)
 
 	raw, err := evalString(page, collectJS)
@@ -125,7 +125,9 @@ func findBrowser() (string, error) {
 		"/usr/bin/chromium",
 		"/usr/bin/google-chrome",
 		"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+		"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
 		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+		"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
 	}
 	for _, c := range cands {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
@@ -135,16 +137,21 @@ func findBrowser() (string, error) {
 	return "", fmt.Errorf("没找到 Chromium 内核浏览器，请安装 Edge/Chrome 或设 VIDEODL_BROWSER 环境变量指向浏览器可执行文件")
 }
 
-func evalString(page *rod.Page, js string) (string, error) {
-	res, err := page.Eval(js)
+// evalString 执行 JS 并把返回的字符串解出来。
+//
+// 两个坑：
+//  1. rod 的 Eval 会把入参包成 `function(){ return (js).apply(this, arguments) }`，
+//     所以 js 必须是**函数形式**（`() => ...` / `function(){}`），不能是表达式或 IIFE；
+//     需要入参时通过 args 传入。
+//  2. gson.JSON.String() 等价于 Sprintf("%v", 已解析的值)，对 JSON 字符串会得到
+//     **去引号后的内容**。所以这里直接用 Str() 取值，不要再 json.Unmarshal 一遍，
+//     否则返回对象时会报 "cannot unmarshal object into Go value of type string"。
+func evalString(page *rod.Page, js string, args ...interface{}) (string, error) {
+	res, err := page.Eval(js, args...)
 	if err != nil {
 		return "", err
 	}
-	var s string
-	if err := json.Unmarshal([]byte(fmt.Sprintf("%s", res.Value)), &s); err != nil {
-		return "", err
-	}
-	return s, nil
+	return res.Value.Str(), nil
 }
 
 // pageCookies 读取页面 Cookie（含 HttpOnly，document.cookie 拿不到的也能透传），
@@ -208,7 +215,8 @@ window.__sniffed = [];
 })();
 `
 
-const collectJS = `JSON.stringify({
+// collectJS 必须是函数形式：rod 会对它调用 .apply(this, arguments)。
+const collectJS = `() => JSON.stringify({
   hooked: window.__sniffed || [],
   resources: performance.getEntriesByType('resource').map(function(r){return r.name;}),
   videos: Array.prototype.map.call(document.querySelectorAll('video,source'), function(e){return e.src||e.currentSrc||'';})
